@@ -1,0 +1,4 @@
+app/dist/
+app/win-unpacked/
+node_modules/
+*.log
