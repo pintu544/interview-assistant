@@ -11,6 +11,7 @@ Screen-aware AI assistant: press a hotkey on any coding problem, get a streamed 
    npm install
    npm run build
    ```
+   (Always full `npm install` — never `--omit=dev`; Electron itself is a devDependency.)
 3. Create `%USERPROFILE%\.interview-assistant\config.json`:
    ```json
    {
