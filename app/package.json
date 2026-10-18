@@ -5,11 +5,16 @@
   "description": "Screen-aware AI assistant with a stealth overlay (personal Windows build)",
   "main": "dist/main/index.js",
   "scripts": {
-    "dev": "node node_modules/vite/bin/vite.js",
+    "dev": "node scripts/dev.mjs",
     "clean": "node node_modules/rimraf/dist/esm/bin.mjs dist",
-    "build": "npm run clean && node node_modules/typescript/bin/tsc -p tsconfig.main.json && node node_modules/vite/bin/vite.js build",
+    "typecheck": "npm run typecheck:main && npm run typecheck:renderer",
+    "typecheck:main": "node node_modules/typescript/bin/tsc -p tsconfig.main.json --noEmit",
+    "typecheck:renderer": "node node_modules/typescript/bin/tsc -p tsconfig.renderer.json --noEmit",
+    "build": "npm run clean && npm run typecheck && node node_modules/typescript/bin/tsc -p tsconfig.main.json && node node_modules/vite/bin/vite.js build && node -e \"require('esbuild').buildSync({entryPoints:['src/main/preload.ts'],bundle:true,platform:'node',format:'cjs',outfile:'dist/main/preload.js',external:['electron']})\"",
     "lint": "node node_modules/eslint/bin/eslint.js src",
-    "format": "node node_modules/prettier/bin/prettier.cjs --write \"src/**/*.{ts,tsx,json,css}\"",
+    "format": "node node_modules/prettier/bin/prettier.cjs --write \"src/**/*.{ts,tsx,json,css}\" \"tests/**/*.cjs\" \"scripts/**/*.mjs\"",
+    "format:check": "node node_modules/prettier/bin/prettier.cjs --check \"src/**/*.{ts,tsx,json,css}\" \"tests/**/*.cjs\" \"scripts/**/*.mjs\"",
+    "test": "npm run build && node --test \"tests/*.test.cjs\"",
     "dist": "npm run build && node node_modules/electron-builder/out/cli/cli.js --win portable"
   },
   "license": "UNLICENSED",
@@ -55,6 +60,10 @@
     "rimraf": "^6.1.3",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.71.1",
-    "vite": "^8.3.4"
+    "vite": "^8.3.4",
+    "esbuild": "^0.28.2"
+  },
+  "engines": {
+    "node": ">=22.12.0"
   }
 }
