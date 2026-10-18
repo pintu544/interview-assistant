@@ -1,11 +1,8 @@
 import { desktopCapturer, screen } from 'electron';
 
-// Screenshot capture: grabs the display under the cursor (multi-monitor aware),
-// downscales to a max width of 1568px to bound token cost, returns base64 PNG.
-// The overlay itself is excluded by setContentProtection, so it never appears
-// in its own captures.
-
-const MAX_WIDTH = 1568;
+// Keep screenshots bounded for predictable latency/token cost on large displays.
+const MAX_CAPTURE_SIDE = 1568;
+const SIZE_TOLERANCE = 4;
 
 export interface CaptureResult {
   base64: string;
@@ -13,46 +10,70 @@ export interface CaptureResult {
   height: number;
 }
 
+function uniqueMatch<T>(label: string, items: T[], predicate: (item: T) => boolean): T | undefined {
+  const matches = items.filter(predicate);
+  if (matches.length > 1)
+    throw new Error(`Ambiguous screen source: ${label} matched ${matches.length} sources`);
+  return matches[0];
+}
+
 export async function captureScreen(): Promise<CaptureResult> {
   const cursor = screen.getCursorScreenPoint();
   const display = screen.getDisplayNearestPoint(cursor);
-  // display.size is in DIP — multiply by scaleFactor for native resolution
-  // (most Windows laptops run at 125%/150% scaling; DIP-sized captures are blurry).
+  // Display dimensions are DIP; request native pixels so high-DPI displays are not blurry.
   const targetWidth = Math.round(display.size.width * display.scaleFactor);
   const targetHeight = Math.round(display.size.height * display.scaleFactor);
-
   const sources = await desktopCapturer.getSources({
     types: ['screen'],
     thumbnailSize: { width: targetWidth, height: targetHeight },
   });
   if (sources.length === 0) throw new Error('No screen source available for capture');
 
-  // Match the source to the display under the cursor. display_id doesn't line
-  // up on every Windows/Electron combo, so fall back through name → size.
-  const byId = sources.find((s) => s.display_id === String(display.id));
-  const byName = byId ?? sources.find((s) => display.label && s.name.includes(display.label));
+  const byId = uniqueMatch(
+    'display id',
+    sources,
+    (source) => source.display_id === String(display.id),
+  );
+  const byName = byId
+    ? undefined
+    : uniqueMatch(
+        'display name',
+        sources,
+        (source) => Boolean(display.label) && source.name === display.label,
+      );
   const bySize =
-    byName ??
-    sources.find(
-      (s) =>
-        Math.abs(s.thumbnail.getSize().width - targetWidth) < 4 &&
-        Math.abs(s.thumbnail.getSize().height - targetHeight) < 4,
-    );
-  const source = bySize ?? sources[0];
+    byId || byName
+      ? undefined
+      : uniqueMatch('display dimensions', sources, (source) => {
+          const size = source.thumbnail.getSize();
+          return (
+            Math.abs(size.width - targetWidth) < SIZE_TOLERANCE &&
+            Math.abs(size.height - targetHeight) < SIZE_TOLERANCE
+          );
+        });
+  const source = byId ?? byName ?? bySize;
+  if (!source) throw new Error(`Unable to uniquely identify display ${String(display.id)}`);
 
-  const image = source.thumbnail;
-  const scale = Math.min(1, MAX_WIDTH / image.getSize().width);
+  const originalSize = source.thumbnail.getSize();
+  if (originalSize.width <= 0 || originalSize.height <= 0) {
+    throw new Error('Screen source returned an empty thumbnail');
+  }
+  const scale = Math.min(1, MAX_CAPTURE_SIDE / Math.max(originalSize.width, originalSize.height));
   const resized =
     scale < 1
-      ? image.resize({
-          width: Math.floor(image.getSize().width * scale),
-          height: Math.floor(image.getSize().height * scale),
+      ? source.thumbnail.resize({
+          width: Math.max(1, Math.floor(originalSize.width * scale)),
+          height: Math.max(1, Math.floor(originalSize.height * scale)),
         })
-      : image;
+      : source.thumbnail;
+  const finalSize = resized.getSize();
+  if (finalSize.width <= 0 || finalSize.height <= 0) {
+    throw new Error('Screen source returned an empty resized thumbnail');
+  }
 
   return {
     base64: resized.toPNG().toString('base64'),
-    width: resized.getSize().width,
-    height: resized.getSize().height,
+    width: finalSize.width,
+    height: finalSize.height,
   };
 }

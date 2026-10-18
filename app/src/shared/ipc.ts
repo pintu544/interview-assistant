@@ -16,6 +16,8 @@ export const IPC = {
   AUDIO_REQUEST: 'audio:request',
   /** Renderer → Main: recent mic audio. Payload: { requestId, base64 }. */
   AUDIO_RESPONSE: 'audio:response',
+  /** Main → Renderer: mouse interaction mode changed. */
+  INTERACTION_CHANGED: 'overlay:interaction',
 } as const;
 
 export interface SolveDeltaPayload {

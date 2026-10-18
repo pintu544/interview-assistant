@@ -12,6 +12,7 @@ interface AssistantBridge {
   onSolveStart: (cb: () => void) => () => void;
   onAudioRequest: (cb: (requestId: string) => void) => () => void;
   sendAudioResponse: (requestId: string, base64: string) => void;
+  onInteractionChanged: (cb: (interactive: boolean) => void) => () => void;
 }
 
 declare global {
@@ -81,6 +82,7 @@ export default function App() {
   const [output, setOutput] = useState('');
   const [status, setStatus] = useState<'idle' | 'thinking' | 'done' | 'error'>('idle');
   const [listening, setListening] = useState(false);
+  const [interactive, setInteractive] = useState(false);
   const bodyRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
   const recorderRef = useRef<MicRecorder | null>(null);
@@ -94,12 +96,19 @@ export default function App() {
     // Start mic capture; the overlay listens from launch. Failure is
     // non-fatal — solves still work, just without transcript context.
     const recorder = new MicRecorder();
+    let active = true;
     recorderRef.current = recorder;
-    recorder.onStateChange = (recording) => setListening(recording);
+    recorder.onStateChange = (recording) => {
+      if (active) setListening(recording);
+    };
     recorder
       .start()
-      .then(() => setListening(recorder.isRecording))
-      .catch(() => setListening(false));
+      .then(() => {
+        if (active) setListening(recorder.isRecording);
+      })
+      .catch(() => {
+        if (active) setListening(false);
+      });
 
     const offStart = bridge.onSolveStart(() => {
       setOutput('');
@@ -114,6 +123,7 @@ export default function App() {
       setStatus(ok ? 'done' : 'error');
       if (!ok && error) setOutput((prev) => prev + `\n\n**Error:** ${error}`);
     });
+    const offInteraction = bridge.onInteractionChanged(setInteractive);
     const offAudio = bridge.onAudioRequest((requestId) => {
       const rec = recorderRef.current;
       if (!rec) {
@@ -129,10 +139,13 @@ export default function App() {
         .catch(() => bridge.sendAudioResponse(requestId, ''));
     });
     return () => {
+      active = false;
       offStart();
       offDelta();
       offDone();
       offAudio();
+      offInteraction();
+      recorder.onStateChange = null;
       recorder.stop();
     };
   }, []);
@@ -167,9 +180,14 @@ export default function App() {
           title={listening ? 'mic live' : 'mic off'}
         />
         <span>assistant</span>
-        <span className="hint">Ctrl+Alt+S solve · Ctrl+Alt+H hide · Ctrl+Alt+Q quit</span>
+        <span className="hint">Ctrl+Alt+S solve · H hide · I scroll · Q quit (Ctrl+Alt)</span>
       </div>
       <div className="body" ref={bodyRef} onScroll={onScroll}>
+        {interactive && (
+          <p className="placeholder">
+            Mouse enabled: scroll to read. Ctrl+Alt+I restores click-through.
+          </p>
+        )}
         {status === 'idle' && <p className="placeholder">Press Ctrl+Alt+S on a problem…</p>}
         {status === 'thinking' && !output && <p className="placeholder">thinking…</p>}
         <div className="output">{renderMarkdown(output)}</div>

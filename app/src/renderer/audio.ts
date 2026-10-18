@@ -41,33 +41,51 @@ export class MicRecorder {
     if (this.starting) return this.starting; // idempotent under concurrency
     const gen = ++this.generation;
     this.starting = (async () => {
+      let stream: MediaStream | null = null;
+      let recorder: MediaRecorder | null = null;
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         if (gen !== this.generation) {
           // stop() raced us — release the orphaned stream.
           stream.getTracks().forEach((t) => t.stop());
           return;
         }
-        this.stream = stream;
         const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
           ? 'audio/webm;codecs=opus'
           : 'audio/webm';
-        const recorder = new MediaRecorder(stream, { mimeType });
+        recorder = new MediaRecorder(stream, { mimeType });
         recorder.ondataavailable = (e: BlobEvent) => {
+          if (gen !== this.generation || this.recorder !== recorder) return;
           if (e.data.size === 0) return;
           if (!this.header) this.header = e.data; // pin the container header
           this.chunks.push({ at: Date.now(), data: e.data });
           const cutoff = Date.now() - WINDOW_MS;
           this.chunks = this.chunks.filter((c) => c.at >= cutoff);
         };
-        recorder.onerror = () => this.handleDeviceLoss();
+        recorder.onerror = () => {
+          if (gen === this.generation && this.recorder === recorder) this.handleDeviceLoss();
+        };
         recorder.onstop = () => {
           // onstop fires on manual stop() too — only treat as loss if unexpected.
-          if (gen === this.generation && this._recording) this.handleDeviceLoss();
+          if (gen === this.generation && this.recorder === recorder && this._recording) {
+            this.handleDeviceLoss();
+          }
         };
-        recorder.start(1000);
+        this.stream = stream;
         this.recorder = recorder;
+        recorder.start(1000);
+        if (gen !== this.generation || this.recorder !== recorder) return;
         this.setRecording(true);
+      } catch (error) {
+        // getUserMedia succeeds before MediaRecorder construction/start can fail.
+        // Release both resources owned by this start, without touching a newer one.
+        if (recorder && this.recorder === recorder) {
+          this.teardown();
+          this.setRecording(false);
+        } else if (stream) {
+          stream.getTracks().forEach((t) => t.stop());
+        }
+        throw error;
       } finally {
         if (gen === this.generation) this.starting = null;
       }
@@ -76,6 +94,8 @@ export class MicRecorder {
   }
 
   private handleDeviceLoss(): void {
+    this.generation++; // invalidate callbacks and any in-flight start
+    this.starting = null;
     this.teardown();
     this.setRecording(false);
   }
@@ -98,16 +118,26 @@ export class MicRecorder {
   }
 
   private teardown(): void {
-    try {
-      this.recorder?.stop();
-    } catch {
-      // Already stopped — ignore.
-    }
-    this.stream?.getTracks().forEach((t) => t.stop());
+    const recorder = this.recorder;
+    const stream = this.stream;
     this.recorder = null;
     this.stream = null;
     this.chunks = [];
     this.header = null;
+
+    // Detach first: stop() may synchronously dispatch onstop in test doubles
+    // and some implementations. Old callbacks must not affect a new session.
+    if (recorder) {
+      recorder.ondataavailable = null;
+      recorder.onerror = null;
+      recorder.onstop = null;
+      try {
+        recorder.stop();
+      } catch {
+        // Already stopped — ignore.
+      }
+    }
+    stream?.getTracks().forEach((t) => t.stop());
   }
 }
 
