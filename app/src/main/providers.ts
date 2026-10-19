@@ -235,7 +235,10 @@ class OpenAiCompatibleProvider implements LlmProvider {
       body: JSON.stringify({
         model: this.cfg.chatModel,
         messages: buildMessages(imageBase64, context),
-        max_tokens: 3000,
+        // max_completion_tokens: required by gpt-5.x and newer; accepted by
+        // older chat models (gpt-4o-mini etc.) and OpenAI-compatible routers.
+        // (max_tokens is rejected by gpt-5.x with 400 unsupported_parameter.)
+        max_completion_tokens: 3000,
         temperature: 0.2,
         stream: true,
       }),
