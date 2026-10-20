@@ -1,0 +1,8 @@
+{
+  "provider": "openai-compatible",
+  "endpoint": "http://127.0.0.1:8787/v1",
+  "apiKey": "mock-key-not-a-secret",
+  "chatModel": "mock-vision",
+  "whisperModel": "mock-whisper",
+  "allowInsecureLocalhost": true
+}

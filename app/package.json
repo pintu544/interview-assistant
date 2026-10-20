@@ -6,6 +6,8 @@
   "main": "dist/main/index.js",
   "scripts": {
     "dev": "node scripts/dev.mjs",
+    "dev:mock": "node scripts/dev-mock.mjs",
+    "mock": "node scripts/mock-provider.mjs",
     "clean": "node node_modules/rimraf/dist/esm/bin.mjs dist",
     "typecheck": "npm run typecheck:main && npm run typecheck:renderer",
     "typecheck:main": "node node_modules/typescript/bin/tsc -p tsconfig.main.json --noEmit",
