@@ -1,15 +1,42 @@
 import { contextBridge, ipcRenderer } from 'electron';
-import { IPC } from '../shared/ipc';
+import { IPC, type AssistantBridge, type SolveProgress } from '../shared/ipc';
 
-// Bundled as one CommonJS file: sandbox preloads cannot require local modules.
 function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' ? (value as Record<string, unknown>) : null;
 }
 
-contextBridge.exposeInMainWorld('assistant', {
+const bridge: AssistantBridge = {
   requestSolve: () => ipcRenderer.send(IPC.SOLVE_REQUEST),
   toggleOverlay: () => ipcRenderer.send(IPC.OVERLAY_TOGGLE),
-  onSolveDelta: (cb: (delta: string) => void) => {
+  getRuntimeInfo: () => ipcRenderer.invoke(IPC.RUNTIME_INFO),
+  startListening: (source) => {
+    if (!['microphone', 'system', 'both'].includes(source))
+      return Promise.resolve({ ok: false, error: 'Invalid audio source.' });
+    return ipcRenderer.invoke(IPC.LISTEN_START, source);
+  },
+  stopListening: (sessionId) => {
+    if (typeof sessionId === 'string' && sessionId.length <= 128)
+      ipcRenderer.send(IPC.LISTEN_STOP, sessionId);
+  },
+  transcribeChunk: (sessionId, sequence, base64) => {
+    if (
+      typeof sessionId !== 'string' ||
+      sessionId.length > 128 ||
+      !Number.isSafeInteger(sequence) ||
+      sequence < 0 ||
+      typeof base64 !== 'string' ||
+      base64.length === 0 ||
+      base64.length > 2 * 1024 * 1024
+    )
+      return Promise.resolve({ ok: false, error: 'Invalid audio clip.' });
+    return ipcRenderer.invoke(IPC.AUDIO_CHUNK, { sessionId, sequence, base64 });
+  },
+  onListeningEnded: (cb) => {
+    const handler = () => cb();
+    ipcRenderer.on(IPC.LISTEN_ENDED, handler);
+    return () => ipcRenderer.removeListener(IPC.LISTEN_ENDED, handler);
+  },
+  onSolveDelta: (cb) => {
     const handler = (_event: unknown, payload: unknown) => {
       const delta = record(payload)?.delta;
       if (typeof delta === 'string') cb(delta);
@@ -17,7 +44,7 @@ contextBridge.exposeInMainWorld('assistant', {
     ipcRenderer.on(IPC.SOLVE_DELTA, handler);
     return () => ipcRenderer.removeListener(IPC.SOLVE_DELTA, handler);
   },
-  onSolveDone: (cb: (ok: boolean, error?: string) => void) => {
+  onSolveDone: (cb) => {
     const handler = (_event: unknown, payload: unknown) => {
       const value = record(payload);
       if (typeof value?.ok === 'boolean')
@@ -26,20 +53,35 @@ contextBridge.exposeInMainWorld('assistant', {
     ipcRenderer.on(IPC.SOLVE_DONE, handler);
     return () => ipcRenderer.removeListener(IPC.SOLVE_DONE, handler);
   },
-  onSolveStart: (cb: () => void) => {
+  onSolveStart: (cb) => {
     const handler = () => cb();
     ipcRenderer.on(IPC.SOLVE_START, handler);
     return () => ipcRenderer.removeListener(IPC.SOLVE_START, handler);
   },
-  onAudioRequest: (cb: (requestId: string) => void) => {
+  onSolveProgress: (cb) => {
     const handler = (_event: unknown, payload: unknown) => {
-      const id = record(payload)?.requestId;
-      if (typeof id === 'string' && id.length <= 128) cb(id);
+      const value = record(payload);
+      if (
+        !value ||
+        typeof value.stage !== 'string' ||
+        !['capture', 'answer', 'complete'].includes(value.stage)
+      )
+        return;
+      for (const key of ['captureMs', 'firstTokenMs', 'totalMs']) {
+        if (
+          value[key] !== undefined &&
+          (typeof value[key] !== 'number' ||
+            !Number.isFinite(value[key]) ||
+            (value[key] as number) < 0)
+        )
+          return;
+      }
+      cb(value as unknown as SolveProgress);
     };
-    ipcRenderer.on(IPC.AUDIO_REQUEST, handler);
-    return () => ipcRenderer.removeListener(IPC.AUDIO_REQUEST, handler);
+    ipcRenderer.on(IPC.SOLVE_PROGRESS, handler);
+    return () => ipcRenderer.removeListener(IPC.SOLVE_PROGRESS, handler);
   },
-  onInteractionChanged: (cb: (interactive: boolean) => void) => {
+  onInteractionChanged: (cb) => {
     const handler = (_event: unknown, payload: unknown) => {
       const value = record(payload)?.interactive;
       if (typeof value === 'boolean') cb(value);
@@ -47,14 +89,6 @@ contextBridge.exposeInMainWorld('assistant', {
     ipcRenderer.on(IPC.INTERACTION_CHANGED, handler);
     return () => ipcRenderer.removeListener(IPC.INTERACTION_CHANGED, handler);
   },
-  sendAudioResponse: (requestId: string, base64: string) => {
-    if (
-      typeof requestId === 'string' &&
-      requestId.length <= 128 &&
-      typeof base64 === 'string' &&
-      base64.length <= 8 * 1024 * 1024
-    ) {
-      ipcRenderer.send(IPC.AUDIO_RESPONSE, { requestId, base64 });
-    }
-  },
-});
+};
+
+contextBridge.exposeInMainWorld('assistant', bridge);

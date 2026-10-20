@@ -1,26 +1,42 @@
-import { app, BrowserWindow, globalShortcut, ipcMain, screen, session } from 'electron';
+import {
+  app,
+  BrowserWindow,
+  desktopCapturer,
+  globalShortcut,
+  ipcMain,
+  screen,
+  session,
+} from 'electron';
 import path from 'path';
 import { randomUUID } from 'crypto';
 import { pathToFileURL } from 'url';
-import { IPC } from '../shared/ipc';
+import { IPC, type AudioSource, type ListenResult, type TranscriptResult } from '../shared/ipc';
 import { captureScreen } from './capture';
-import { loadConfig } from './config';
-import { createProvider, ProviderError } from './providers';
+import { loadConfig, type AssistantConfig } from './config';
+import { createProvider, type LlmProvider } from './providers';
 import { abortable, abortError } from './lifecycle';
 
-// Main owns credentials, capture and provider calls; the renderer remains sandboxed.
 let overlay: BrowserWindow | null = null;
 let solving = false;
-let interactive = false;
+let interactive = true;
 let activeController: AbortController | null = null;
 const HOTKEY_SOLVE = 'CommandOrControl+Alt+S';
 const HOTKEY_TOGGLE = 'CommandOrControl+Alt+H';
 const HOTKEY_INTERACT = 'CommandOrControl+Alt+I';
 const HOTKEY_QUIT = 'CommandOrControl+Alt+Q';
 const SOLVE_TIMEOUT_MS = 25_000;
-const MAX_AUDIO_BASE64 = 8 * 1024 * 1024;
 const rendererFile = path.join(__dirname, '../renderer/index.html');
 const isDevelopment = process.env.NODE_ENV === 'development';
+
+interface ListeningSession {
+  id: string;
+  source: AudioSource;
+  provider: LlmProvider;
+  controller: AbortController | null;
+  sequence: number;
+  entries: Array<{ at: number; text: string }>;
+}
+let listening: ListeningSession | null = null;
 
 function trustedRenderer(url: string): boolean {
   try {
@@ -33,10 +49,40 @@ function trustedRenderer(url: string): boolean {
   }
 }
 
+function isOwner(event: Electron.IpcMainEvent | Electron.IpcMainInvokeEvent): boolean {
+  return (
+    !!overlay &&
+    !overlay.isDestroyed() &&
+    event.sender === overlay.webContents &&
+    event.senderFrame === overlay.webContents.mainFrame &&
+    trustedRenderer(overlay.webContents.getURL())
+  );
+}
+
+function transcriptionEnabled(cfg: AssistantConfig): boolean {
+  return (
+    cfg.transcriptionEnabled !== false &&
+    new URL(cfg.endpoint).hostname !== 'integrate.api.nvidia.com'
+  );
+}
+
 function send(channel: string, payload?: unknown): void {
-  if (overlay && !overlay.isDestroyed() && !overlay.webContents.isDestroyed()) {
+  if (overlay && !overlay.isDestroyed() && !overlay.webContents.isDestroyed())
     overlay.webContents.send(channel, payload);
-  }
+}
+
+function stopListening(): void {
+  listening?.controller?.abort();
+  listening = null;
+  send(IPC.LISTEN_ENDED);
+}
+
+function transcriptText(current: ListeningSession): string {
+  current.entries = current.entries.filter((entry) => Date.now() - entry.at < 60_000);
+  return current.entries
+    .map((entry) => entry.text)
+    .join(' ')
+    .slice(-8000);
 }
 
 function showOverlayInactive(): void {
@@ -57,7 +103,7 @@ function createOverlay(): BrowserWindow {
     skipTaskbar: true,
     resizable: true,
     show: false,
-    focusable: false,
+    focusable: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -66,36 +112,48 @@ function createOverlay(): BrowserWindow {
     },
   });
   win.setContentProtection(true);
-  win.setIgnoreMouseEvents(true);
+  win.setIgnoreMouseEvents(false);
   win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   win.webContents.on('will-navigate', (event, url) => {
     if (!trustedRenderer(url)) event.preventDefault();
   });
+  win.webContents.on('did-start-loading', stopListening);
+  win.webContents.on('render-process-gone', stopListening);
+  win.on('hide', stopListening);
+  win.on('minimize', stopListening);
   win.on('closed', () => {
     activeController?.abort();
+    stopListening();
     if (overlay === win) overlay = null;
     app.quit();
   });
   const loading = isDevelopment ? win.loadURL('http://localhost:5173') : win.loadFile(rendererFile);
-  void loading.catch((error: unknown) => {
-    console.error(
-      'Unable to load overlay:',
-      error instanceof Error ? error.message : String(error),
-    );
-    activeController?.abort();
-  });
+  void loading
+    .then(() => {
+      if (!win.isDestroyed()) win.showInactive();
+    })
+    .catch((error: unknown) => {
+      console.error(
+        'Unable to load overlay:',
+        error instanceof Error ? error.message : String(error),
+      );
+      activeController?.abort();
+    });
   return win;
 }
 
 function toggleOverlay(): void {
   if (!overlay || overlay.isDestroyed()) return;
-  if (overlay.isVisible()) overlay.hide();
-  else overlay.showInactive();
+  if (overlay.isVisible()) {
+    stopListening();
+    overlay.hide();
+  } else overlay.showInactive();
 }
 
 function toggleInteraction(): void {
   if (!overlay || overlay.isDestroyed()) return;
+  if (listening) return;
   interactive = !interactive;
   overlay.setIgnoreMouseEvents(!interactive);
   send(IPC.INTERACTION_CHANGED, { interactive });
@@ -104,6 +162,7 @@ function toggleInteraction(): void {
 
 function registerHotkey(accelerator: string, handler: () => void): void {
   if (globalShortcut.register(accelerator, handler)) return;
+  console.error(`Hotkey registration failed: ${accelerator}`);
   const notify = () => {
     showOverlayInactive();
     send(IPC.SOLVE_DONE, {
@@ -151,93 +210,99 @@ async function waitForLoad(signal: AbortSignal): Promise<void> {
   });
 }
 
-/** Recent audio is optional; validate sender and bounded payload before decoding. */
-function requestRecentAudio(signal: AbortSignal): Promise<string> {
-  return new Promise((resolve) => {
-    if (!overlay || overlay.isDestroyed() || signal.aborted) return resolve('');
-    const owner = overlay.webContents;
-    const requestId = randomUUID();
-    const cleanup = () => {
-      clearTimeout(timeout);
-      ipcMain.removeListener(IPC.AUDIO_RESPONSE, onResponse);
-      signal.removeEventListener('abort', onAbort);
-    };
-    const finish = (audio: string) => {
-      cleanup();
-      resolve(audio);
-    };
-    const onAbort = () => finish('');
-    const onResponse = (event: Electron.IpcMainEvent, payload: unknown) => {
-      if (event.sender !== owner || event.senderFrame !== owner.mainFrame) return;
-      if (!payload || typeof payload !== 'object') return;
-      const response = payload as { requestId?: unknown; base64?: unknown };
-      if (response.requestId !== requestId || typeof response.base64 !== 'string') return;
-      if (
-        response.base64.length > MAX_AUDIO_BASE64 ||
-        !/^[A-Za-z0-9+/]*={0,2}$/.test(response.base64)
-      ) {
-        finish('');
-        return;
-      }
-      finish(response.base64);
-    };
-    const timeout = setTimeout(() => finish(''), 5000);
-    ipcMain.on(IPC.AUDIO_RESPONSE, onResponse);
-    signal.addEventListener('abort', onAbort, { once: true });
-    send(IPC.AUDIO_REQUEST, { requestId });
-  });
+async function transcribeChunk(payload: unknown): Promise<TranscriptResult> {
+  if (!payload || typeof payload !== 'object') return { ok: false, error: 'Invalid audio clip.' };
+  const data = payload as { sessionId?: unknown; sequence?: unknown; base64?: unknown };
+  const current = listening;
+  if (!current || data.sessionId !== current.id || !overlay?.isVisible())
+    return { ok: false, error: 'Listening has stopped.' };
+  if (current.controller) return { ok: false, error: 'Transcription is still busy.' };
+  if (
+    !Number.isSafeInteger(data.sequence) ||
+    (data.sequence as number) <= current.sequence ||
+    typeof data.base64 !== 'string' ||
+    !data.base64.length ||
+    data.base64.length > 2 * 1024 * 1024 ||
+    data.base64.length % 4 !== 0 ||
+    !/^[A-Za-z0-9+/]*={0,2}$/.test(data.base64)
+  )
+    return { ok: false, error: 'Invalid audio clip.' };
+  current.sequence = data.sequence as number;
+  const controller = new AbortController();
+  current.controller = controller;
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+  try {
+    const text = await abortable(
+      current.provider.transcribe(
+        Buffer.from(data.base64, 'base64'),
+        'audio.webm',
+        controller.signal,
+        transcriptText(current).slice(-1000),
+      ),
+      controller.signal,
+    );
+    if (listening !== current) return { ok: false, error: 'Listening has stopped.' };
+    if (text.trim()) current.entries.push({ at: Date.now(), text: text.trim().slice(0, 4000) });
+    current.entries = current.entries.slice(-12);
+    return { ok: true, text: transcriptText(current) };
+  } catch (error) {
+    const message = controller.signal.aborted
+      ? 'Transcription timed out or was stopped.'
+      : error instanceof Error
+        ? error.message
+        : 'Transcription failed.';
+    return { ok: false, error: message };
+  } finally {
+    clearTimeout(timeout);
+    if (current.controller === controller) current.controller = null;
+  }
 }
 
 async function runSolve(): Promise<void> {
   if (!overlay || overlay.isDestroyed() || solving) return;
   solving = true;
+  const started = Date.now();
   const controller = new AbortController();
   activeController = controller;
-  // This deadline includes renderer readiness and non-abortable desktop capture.
   const timeout = setTimeout(() => controller.abort(), SOLVE_TIMEOUT_MS);
   showOverlayInactive();
   try {
     await waitForLoad(controller.signal);
     send(IPC.SOLVE_START);
+    send(IPC.SOLVE_PROGRESS, { stage: 'capture' });
     const cfg = loadConfig();
     const provider = createProvider(cfg);
-    const transcriptionEnabled =
-      cfg.transcriptionEnabled !== false &&
-      new URL(cfg.endpoint).hostname !== 'integrate.api.nvidia.com';
-    const [shot, audioBase64] = await abortable(
-      Promise.all([
-        captureScreen(),
-        transcriptionEnabled ? requestRecentAudio(controller.signal) : Promise.resolve(''),
-      ]),
-      controller.signal,
-    );
-    let transcript: string | undefined;
-    if (audioBase64) {
-      try {
-        transcript = await abortable(
-          provider.transcribe(Buffer.from(audioBase64, 'base64'), 'audio.webm', controller.signal),
-          controller.signal,
-        );
-      } catch (error) {
-        if (controller.signal.aborted) throw abortError();
-        // Auth failures are actionable. Unsupported ASR and transient audio errors are optional.
-        if (error instanceof ProviderError && (error.status === 401 || error.status === 403))
-          throw error;
-      }
-    }
+    const captureStarted = Date.now();
+    const shot = await abortable(captureScreen(), controller.signal);
+    const captureMs = Date.now() - captureStarted;
+    // Completed background transcripts are used; an in-flight ASR request never blocks a solve.
+    const transcript = listening && transcriptionEnabled(cfg) ? transcriptText(listening) : '';
+    send(IPC.SOLVE_PROGRESS, { stage: 'answer', captureMs });
+    let firstTokenMs: number | undefined;
     await abortable(
       provider.solve(
         shot.base64,
         transcript || undefined,
         {
           onDelta: (delta) => {
-            if (!controller.signal.aborted) send(IPC.SOLVE_DELTA, { delta });
+            if (controller.signal.aborted) return;
+            if (firstTokenMs === undefined) {
+              firstTokenMs = Date.now() - started;
+              send(IPC.SOLVE_PROGRESS, { stage: 'answer', captureMs, firstTokenMs });
+            }
+            send(IPC.SOLVE_DELTA, { delta });
           },
         },
         controller.signal,
       ),
       controller.signal,
     );
+    send(IPC.SOLVE_PROGRESS, {
+      stage: 'complete',
+      captureMs,
+      firstTokenMs,
+      totalMs: Date.now() - started,
+    });
     send(IPC.SOLVE_DONE, { ok: true });
   } catch (error) {
     const message = controller.signal.aborted
@@ -261,29 +326,114 @@ else {
     session.defaultSession.setPermissionRequestHandler(
       (contents, permission, callback, details) => {
         const mediaTypes = (details as { mediaTypes?: string[] }).mediaTypes ?? [];
+        // Electron reports display-media authorization with an empty mediaTypes list.
+        const displayMedia = mediaTypes.length === 0 && listening?.source !== 'microphone';
         callback(
-          contents === overlay?.webContents &&
+          !!listening &&
+            overlay?.isVisible() === true &&
+            contents === overlay.webContents &&
             trustedRenderer(contents.getURL()) &&
-            permission === 'media' &&
-            mediaTypes.includes('audio') &&
-            !mediaTypes.includes('video'),
+            details.isMainFrame &&
+            trustedRenderer(details.requestingUrl) &&
+            ((permission === 'media' &&
+              (displayMedia ||
+                (listening.source !== 'system' &&
+                  mediaTypes.includes('audio') &&
+                  !mediaTypes.includes('video')))) ||
+              (permission === 'display-capture' && listening.source !== 'microphone')),
         );
       },
     );
     session.defaultSession.setPermissionCheckHandler(
       (contents, permission, _origin, details) =>
-        contents === overlay?.webContents &&
+        !!listening &&
+        overlay?.isVisible() === true &&
+        contents === overlay.webContents &&
         trustedRenderer(contents.getURL()) &&
-        permission === 'media' &&
-        details.mediaType === 'audio',
+        details.isMainFrame &&
+        trustedRenderer(details.requestingUrl ?? '') &&
+        ((permission === 'media' &&
+          listening.source !== 'system' &&
+          details.mediaType === 'audio') ||
+          (permission === 'display-capture' && listening.source !== 'microphone')),
     );
+    session.defaultSession.setDisplayMediaRequestHandler((request, callback) => {
+      const current = listening;
+      if (
+        !current ||
+        current.source === 'microphone' ||
+        process.platform !== 'win32' ||
+        !overlay?.isVisible() ||
+        request.frame !== overlay.webContents.mainFrame ||
+        !trustedRenderer(request.frame.url) ||
+        !request.userGesture ||
+        !request.audioRequested
+      ) {
+        callback({});
+        return;
+      }
+      void desktopCapturer
+        .getSources({ types: ['screen'], thumbnailSize: { width: 0, height: 0 } })
+        .then((sources) => {
+          if (listening !== current || !overlay?.isVisible() || !sources.length)
+            return callback({});
+          callback({ video: sources[0], audio: 'loopback' });
+        })
+        .catch(() => callback({}));
+    });
     overlay = createOverlay();
     registerHotkey(HOTKEY_SOLVE, () => void runSolve());
     registerHotkey(HOTKEY_TOGGLE, toggleOverlay);
     registerHotkey(HOTKEY_INTERACT, toggleInteraction);
     registerHotkey(HOTKEY_QUIT, () => app.quit());
-    const isOwner = (event: Electron.IpcMainEvent) =>
-      event.sender === overlay?.webContents && event.senderFrame === overlay.webContents.mainFrame;
+    ipcMain.handle(IPC.RUNTIME_INFO, (event) => {
+      if (!isOwner(event)) throw new Error('Untrusted caller.');
+      const cfg = loadConfig();
+      return {
+        mode: cfg.chatModel === 'mock-vision' ? 'mock' : 'live',
+        model: cfg.chatModel,
+        transcriptionEnabled: transcriptionEnabled(cfg),
+      };
+    });
+    ipcMain.handle(IPC.LISTEN_START, (event, source: unknown): ListenResult => {
+      if (!isOwner(event) || !overlay?.isVisible())
+        return { ok: false, error: 'Open the app to start listening.' };
+      if (source !== 'microphone' && source !== 'system' && source !== 'both')
+        return { ok: false, error: 'Invalid audio source.' };
+      if (source !== 'microphone' && process.platform !== 'win32')
+        return { ok: false, error: 'Computer audio is supported on Windows only.' };
+      if (listening) return { ok: false, error: 'A listening session is already active.' };
+      try {
+        const cfg = loadConfig();
+        if (!transcriptionEnabled(cfg))
+          return { ok: false, error: 'Transcription is disabled in your provider config.' };
+        listening = {
+          id: randomUUID(),
+          source,
+          provider: createProvider(cfg),
+          controller: null,
+          sequence: -1,
+          entries: [],
+        };
+        interactive = true;
+        overlay.setIgnoreMouseEvents(false);
+        send(IPC.INTERACTION_CHANGED, { interactive });
+        return { ok: true, sessionId: listening.id };
+      } catch (error) {
+        return {
+          ok: false,
+          error: error instanceof Error ? error.message : 'Unable to start transcription.',
+        };
+      }
+    });
+    ipcMain.handle(IPC.AUDIO_CHUNK, (event, payload: unknown) =>
+      isOwner(event)
+        ? transcribeChunk(payload)
+        : Promise.resolve({ ok: false, error: 'Untrusted caller.' }),
+    );
+    ipcMain.on(IPC.LISTEN_STOP, (event, id: unknown) => {
+      if (isOwner(event) && id === listening?.id) stopListening();
+    });
     ipcMain.on(IPC.SOLVE_REQUEST, (event) => {
       if (isOwner(event)) void runSolve();
     });
@@ -294,6 +444,7 @@ else {
 }
 app.on('will-quit', () => {
   activeController?.abort();
+  stopListening();
   globalShortcut.unregisterAll();
 });
 app.on('window-all-closed', () => app.quit());

@@ -15,12 +15,17 @@ export interface AssistantConfig {
   transcriptionEnabled?: boolean;
   /** Azure API version. Optional for compatible Azure gateways. */
   apiVersion?: string;
+  /** Omitted by default: reasoning models (gpt-5.x and newer) reject non-default values. */
+  temperature?: number;
   /** Permit plain HTTP only for loopback endpoints used for local development. */
   allowInsecureLocalhost?: boolean;
 }
 
 const REQUIRED_KEYS = ['provider', 'endpoint', 'apiKey', 'chatModel'] as const;
-const CONFIG_PATH = path.join(os.homedir(), '.interview-assistant', 'config.json');
+// Overridable so tests and the mock harness can use a throwaway config instead of the user's real one.
+const CONFIG_PATH = process.env.INTERVIEW_ASSISTANT_CONFIG
+  ? path.resolve(process.env.INTERVIEW_ASSISTANT_CONFIG)
+  : path.join(os.homedir(), '.interview-assistant', 'config.json');
 
 export function configPath(): string {
   return CONFIG_PATH;
@@ -118,6 +123,12 @@ export function loadConfig(): AssistantConfig {
   const transcriptionEnabled = cfg.transcriptionEnabled !== false;
   if (transcriptionEnabled) requiredString(cfg.whisperModel, 'whisperModel');
   if (typeof cfg.apiVersion !== 'undefined') requiredString(cfg.apiVersion, 'apiVersion');
+  if (typeof cfg.temperature !== 'undefined') {
+    const t = cfg.temperature;
+    if (typeof t !== 'number' || !Number.isFinite(t) || t < 0 || t > 2) {
+      throw new Error('Config field temperature must be a number between 0 and 2.');
+    }
+  }
   if (cfg.provider === 'azure') requiredString(cfg.apiVersion, 'apiVersion');
   return { ...cfg, transcriptionEnabled } as AssistantConfig;
 }

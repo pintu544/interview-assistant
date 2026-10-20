@@ -1,7 +1,11 @@
 import { AssistantConfig } from './config';
 
-const SOLVER_SYSTEM_PROMPT = `You are a senior engineer helping a candidate in a live coding interview.
-Given a screenshot of a coding problem, respond with EXACTLY this structure:
+const SOLVER_SYSTEM_PROMPT = `You are a coding assistant helping with programming problems.
+Read the screenshot carefully. Follow the visible language, function signature, and constraints.
+Use the recent transcript only as supporting context; it may contain recognition mistakes.
+If essential problem details are missing or unreadable, ask a concise clarification instead of inventing them.
+Check the proposed algorithm against the visible examples and edge cases before answering.
+For a complete problem, respond with this structure:
 
 ## Solution
 \`\`\`<language>
@@ -27,7 +31,12 @@ export interface LlmProvider {
     cb: SolveCallbacks,
     signal: AbortSignal,
   ): Promise<void>;
-  transcribe(audio: Buffer, filename?: string, signal?: AbortSignal): Promise<string>;
+  transcribe(
+    audio: Buffer,
+    filename?: string,
+    signal?: AbortSignal,
+    context?: string,
+  ): Promise<string>;
 }
 
 export class ProviderError extends Error {
@@ -50,12 +59,20 @@ function buildMessages(imageBase64: string, context: string | undefined): ChatMe
     { type: 'image_url', image_url: { url: `data:image/png;base64,${imageBase64}` } },
   ];
   if (context)
-    userContent.push({ type: 'text', text: `Interview context (transcript): ${context}` });
+    userContent.push({
+      type: 'text',
+      text: `Recent audio transcript (may be incomplete): ${context}`,
+    });
   userContent.push({ type: 'text', text: 'Solve the coding problem shown in this screenshot.' });
   return [
     { role: 'system', content: SOLVER_SYSTEM_PROMPT },
     { role: 'user', content: userContent },
   ];
+}
+
+/** Reasoning models reject a non-default temperature, so the field is only sent when configured. */
+function sampling(cfg: AssistantConfig): Record<string, number> {
+  return typeof cfg.temperature === 'number' ? { temperature: cfg.temperature } : {};
 }
 
 async function enrichedError(res: Response, label: string): Promise<ProviderError> {
@@ -156,10 +173,16 @@ async function streamDeltas(res: Response, cb: SolveCallbacks, label: string): P
   }
 }
 
-function transcriptionForm(audio: Buffer, model: string, filename: string): FormData {
+function transcriptionForm(
+  audio: Buffer,
+  model: string,
+  filename: string,
+  context?: string,
+): FormData {
   const form = new FormData();
   form.append('file', new Blob([new Uint8Array(audio)], { type: 'audio/webm' }), filename);
   form.append('model', model);
+  if (context) form.append('prompt', context);
   return form;
 }
 
@@ -191,7 +214,7 @@ class AzureProvider implements LlmProvider {
         body: JSON.stringify({
           messages: buildMessages(imageBase64, context),
           max_tokens: 3000,
-          temperature: 0.2,
+          ...sampling(this.cfg),
           stream: true,
         }),
         signal,
@@ -199,7 +222,12 @@ class AzureProvider implements LlmProvider {
     );
     await streamDeltas(res, cb, 'Azure OpenAI');
   }
-  async transcribe(audio: Buffer, filename = 'audio.webm', signal?: AbortSignal): Promise<string> {
+  async transcribe(
+    audio: Buffer,
+    filename = 'audio.webm',
+    signal?: AbortSignal,
+    context?: string,
+  ): Promise<string> {
     if (this.cfg.transcriptionEnabled === false) return '';
     const model = this.cfg.whisperModel!;
     const res = await fetch(
@@ -207,7 +235,7 @@ class AzureProvider implements LlmProvider {
       {
         method: 'POST',
         headers: { 'api-key': this.cfg.apiKey },
-        body: transcriptionForm(audio, model, filename),
+        body: transcriptionForm(audio, model, filename, context),
         signal,
       },
     );
@@ -239,20 +267,25 @@ class OpenAiCompatibleProvider implements LlmProvider {
         // older chat models (gpt-4o-mini etc.) and OpenAI-compatible routers.
         // (max_tokens is rejected by gpt-5.x with 400 unsupported_parameter.)
         max_completion_tokens: 3000,
-        temperature: 0.2,
+        ...sampling(this.cfg),
         stream: true,
       }),
       signal,
     });
     await streamDeltas(res, cb, 'LLM');
   }
-  async transcribe(audio: Buffer, filename = 'audio.webm', signal?: AbortSignal): Promise<string> {
+  async transcribe(
+    audio: Buffer,
+    filename = 'audio.webm',
+    signal?: AbortSignal,
+    context?: string,
+  ): Promise<string> {
     if (this.cfg.transcriptionEnabled === false) return '';
     const model = this.cfg.whisperModel!;
     const res = await fetch(this.url('/audio/transcriptions'), {
       method: 'POST',
       headers: this.headers(),
-      body: transcriptionForm(audio, model, filename),
+      body: transcriptionForm(audio, model, filename, context),
       signal,
     });
     return parseTranscript(res, 'Transcription');

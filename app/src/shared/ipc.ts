@@ -1,30 +1,60 @@
-// Shared IPC contracts between main and renderer processes.
-// Channels are the only cross-process API; payloads are JSON-serializable.
-
 export const IPC = {
-  /** Main → Renderer: a new solve started — clear output, show "thinking". */
   SOLVE_START: 'solve:start',
-  /** Renderer → Main: request a screenshot solve. Payload: none (main captures). */
   SOLVE_REQUEST: 'solve:request',
-  /** Main → Renderer: streamed markdown delta. Payload: { delta: string }. */
   SOLVE_DELTA: 'solve:delta',
-  /** Main → Renderer: solve finished. Payload: { ok: boolean; error?: string }. */
   SOLVE_DONE: 'solve:done',
-  /** Renderer → Main: toggle overlay visibility. */
+  SOLVE_PROGRESS: 'solve:progress',
   OVERLAY_TOGGLE: 'overlay:toggle',
-  /** Main → Renderer: send recent mic audio. Payload: { requestId: string }. */
-  AUDIO_REQUEST: 'audio:request',
-  /** Renderer → Main: recent mic audio. Payload: { requestId, base64 }. */
-  AUDIO_RESPONSE: 'audio:response',
-  /** Main → Renderer: mouse interaction mode changed. */
   INTERACTION_CHANGED: 'overlay:interaction',
+  RUNTIME_INFO: 'runtime:info',
+  LISTEN_START: 'listen:start',
+  LISTEN_STOP: 'listen:stop',
+  LISTEN_ENDED: 'listen:ended',
+  AUDIO_CHUNK: 'audio:chunk',
 } as const;
 
-export interface SolveDeltaPayload {
-  delta: string;
+export type AudioSource = 'microphone' | 'system' | 'both';
+
+export interface RuntimeInfo {
+  mode: 'mock' | 'live';
+  model: string;
+  transcriptionEnabled: boolean;
 }
 
-export interface SolveDonePayload {
+export interface ListenResult {
   ok: boolean;
+  sessionId?: string;
   error?: string;
+}
+
+export interface TranscriptResult {
+  ok: boolean;
+  text?: string;
+  error?: string;
+}
+
+export interface SolveProgress {
+  stage: 'capture' | 'answer' | 'complete';
+  captureMs?: number;
+  firstTokenMs?: number;
+  totalMs?: number;
+}
+
+export interface AssistantBridge {
+  requestSolve: () => void;
+  toggleOverlay: () => void;
+  getRuntimeInfo: () => Promise<RuntimeInfo>;
+  startListening: (source: AudioSource) => Promise<ListenResult>;
+  stopListening: (sessionId: string) => void;
+  transcribeChunk: (
+    sessionId: string,
+    sequence: number,
+    base64: string,
+  ) => Promise<TranscriptResult>;
+  onListeningEnded: (cb: () => void) => () => void;
+  onSolveDelta: (cb: (delta: string) => void) => () => void;
+  onSolveDone: (cb: (ok: boolean, error?: string) => void) => () => void;
+  onSolveStart: (cb: () => void) => () => void;
+  onSolveProgress: (cb: (progress: SolveProgress) => void) => () => void;
+  onInteractionChanged: (cb: (interactive: boolean) => void) => () => void;
 }

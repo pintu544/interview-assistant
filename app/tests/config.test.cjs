@@ -2,6 +2,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { execFileSync } = require('node:child_process');
 
 const home = fs.mkdtempSync(path.join(os.tmpdir(), 'interview-config-'));
 process.env.HOME = home;
@@ -60,6 +61,24 @@ try {
     fs.symlinkSync(target, file);
     assert.throws(() => config.loadConfig(), /symbolic link/);
   }
+  write(base);
+  assert.equal(config.configPath(), file);
+  const overrideFile = path.join(home, 'override.json');
+  fs.writeFileSync(
+    overrideFile,
+    JSON.stringify({ ...base, endpoint: 'https://override.example/v1' }),
+    { mode: 0o600 },
+  );
+  const overridden = execFileSync(
+    process.execPath,
+    [
+      '-e',
+      'console.log(require(process.argv[1]).loadConfig().endpoint)',
+      path.join(__dirname, '..', 'dist', 'main', 'config.js'),
+    ],
+    { env: { ...process.env, INTERVIEW_ASSISTANT_CONFIG: overrideFile }, encoding: 'utf8' },
+  ).trim();
+  assert.equal(overridden, 'https://override.example/v1');
   console.log('config tests: ok');
 } finally {
   try {
