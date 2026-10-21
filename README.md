@@ -1,5 +1,7 @@
 # Interview Assistant (personal Windows build)
 
+[![CI](https://github.com/pintu544/interview-assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/pintu544/interview-assistant/actions/workflows/ci.yml)
+
 Screen-aware AI assistant: press a hotkey on a coding problem, get a streamed solution in a stealth overlay. Screen-share hiding is **best effort**: Windows, Electron, and the meeting application can differ, so verify it in the exact app and sharing mode you use.
 
 ## Setup (Windows)
